@@ -123,9 +123,9 @@ Respond ONLY with a JSON object, no markdown, no explanation outside the JSON:
         setError(null);
         try {
           const [xauRes, dxyRes, h1Res] = await Promise.all([
-            fetch(`https://api.twelvedata.com/quote?symbol=XAUUSD&apikey=${TD_KEY}`),
+            fetch(`https://api.twelvedata.com/quote?symbol=XAU/USD&apikey=${TD_KEY}`),
             fetch(`https://api.twelvedata.com/quote?symbol=DXY&apikey=${TD_KEY}`),
-            fetch(`https://api.twelvedata.com/time_series?symbol=XAUUSD&interval=1h&outputsize=24&apikey=${TD_KEY}`)
+            fetch(`https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=1h&outputsize=24&apikey=${TD_KEY}`)
           ]);
           const [xau, dxy, h1] = await Promise.all([xauRes.json(), dxyRes.json(), h1Res.json()]);
           if (xau.status === "error") throw new Error(xau.message || "XAU fetch failed");
@@ -176,12 +176,10 @@ Last 5 H1 candles: ${lastCandles}
 Provide full trading recommendation as JSON.`;
 
         try {
-          // Try Anthropic API via allorigins proxy
-          const apiBody = JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 1000, system: SYSTEM_PROMPT, messages: [{ role: "user", content: prompt }] });
           const res = await fetch("https://api.anthropic.com/v1/messages", {
             method: "POST",
-            headers: { "Content-Type": "application/json", "anthropic-dangerous-direct-browser-access": "true" },
-            body: apiBody
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 1000, system: SYSTEM_PROMPT, messages: [{ role: "user", content: prompt }] })
           });
           const data = await res.json();
           const text = (data.content || []).map(b => b.text || "").join("");
@@ -189,30 +187,7 @@ Provide full trading recommendation as JSON.`;
           setAnalysis(parsed);
           setHistory(prev => [{ ...parsed, time: new Date(), price: mkt.price }, ...prev].slice(0, 8));
         } catch (e) {
-          // Fallback: rule-based analysis
-          const sess = getSession();
-          const bullish = mkt.aboveEma && mkt.dxyChg < 0;
-          const bearish = !mkt.aboveEma && mkt.dxyChg > 0.2;
-          const signal = bullish ? "BUY" : bearish ? "SELL" : "WAIT";
-          const confidence = bullish || bearish ? 62 : 45;
-          const fallback = {
-            signal, confidence,
-            summary: `Rule-based analysis: Price is ${mkt.aboveEma ? "above" : "below"} EMA200 with DXY ${mkt.dxyChg > 0 ? "rising" : "falling"}. ${sess.name} session active.`,
-            reasoning: [
-              `H1 EMA200 at ${fmt(mkt.ema,2)} — price is ${mkt.aboveEma ? "above (bullish macro bias)" : "below (bearish macro bias)"}`,
-              `DXY at ${fmt(mkt.dxy,3)} (${mkt.dxyChg >= 0 ? "+" : ""}${fmt(mkt.dxyChg,2)}%) — ${mkt.dxyChg > 0.2 ? "rising DXY pressures gold lower" : mkt.dxyChg < -0.2 ? "falling DXY supports gold higher" : "DXY flat, neutral impact"}`,
-              `ATR(14) at ${mkt.atr} — ${parseFloat(mkt.atr) > 15 ? "high volatility, widen stops" : parseFloat(mkt.atr) > 8 ? "normal volatility conditions" : "low volatility, breakout may be near"}`,
-              `${sess.name} session — ${sess.name === "LONDON" || sess.name === "NEW YORK" ? "active session, higher probability setups" : "off-peak hours, reduced liquidity"}`
-            ],
-            entry: `${fmt(mkt.price - 2, 2)} - ${fmt(mkt.price, 2)}`,
-            stopLoss: `${fmt(mkt.price - (signal === "BUY" ? 1 : -1) * parseFloat(mkt.atr) * 2, 2)} (~${fmt(parseFloat(mkt.atr) * 2, 0)} pips)`,
-            takeProfit: `${fmt(mkt.price + (signal === "BUY" ? 1 : -1) * parseFloat(mkt.atr) * 4, 2)} (~${fmt(parseFloat(mkt.atr) * 4, 0)} pips)`,
-            rr: "1:2.0",
-            bias: mkt.aboveEma ? "BULLISH" : "BEARISH",
-            warning: "Rule-based fallback — AI API unavailable from this browser. Use Claude.ai for full AI analysis."
-          };
-          setAnalysis(fallback);
-          setHistory(prev => [{ ...fallback, time: new Date(), price: mkt.price }, ...prev].slice(0, 8));
+          setError("AI analysis failed: " + e.message);
         } finally {
           setLoadingAI(false);
         }
