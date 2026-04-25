@@ -6,20 +6,351 @@
   <meta name="apple-mobile-web-app-capable" content="yes"/>
   <meta name="apple-mobile-web-app-title" content="AURUM"/>
   <title>AURUM — XAUUSD AI Agent</title>
-  <link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Bebas+Neue&display=swap" rel="stylesheet"/>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Bebas+Neue&display=swap" rel="stylesheet"/>
   <style>
     *{box-sizing:border-box;margin:0;padding:0}
-    body{background:#050505}
+    body{background:#050505;color:#ddd;font-family:'Space Mono',monospace}
+    ::-webkit-scrollbar{width:3px}::-webkit-scrollbar-thumb{background:#1a1a1a}
+    @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.3}}
+    @keyframes fadeUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+    @keyframes spin{to{transform:rotate(360deg)}}
+    @keyframes shimmer{0%{opacity:0.3}50%{opacity:0.7}100%{opacity:0.3}}
+    button{cursor:pointer;transition:all 0.15s;border:none}
+    button:hover{opacity:0.8}
   </style>
 </head>
 <body>
   <div id="root"></div>
-  <script type="text/babel" src="./src/App.jsx"></script>
   <script type="text/babel">
-    ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(AurumAgent));
+    const { useState, useEffect, useCallback, useRef } = React;
+
+    const TD_KEY = "c03ef2fbd89243218202954dd29a2376";
+    const REFRESH_INTERVAL = 5 * 60 * 1000;
+
+    const SYSTEM_PROMPT = `You are an elite XAUUSD (Gold) trading analyst. You receive live market data and must produce a precise trading recommendation.
+Analyze using: SMC concepts (FVG, BOS, liquidity), DXY inverse correlation, session timing, EMA200 macro bias, ATR volatility, candle structure.
+Respond ONLY with a JSON object, no markdown, no explanation outside the JSON:
+{"signal":"BUY"|"SELL"|"WAIT","confidence":0-100,"summary":"1-2 sentence summary","reasoning":["reason 1","reason 2","reason 3","reason 4"],"entry":"price range","stopLoss":"price + pips","takeProfit":"price + pips","rr":"e.g. 1:3.1","bias":"BULLISH"|"BEARISH"|"NEUTRAL","warning":"string or null"}`;
+
+    const getSession = () => {
+      const h = new Date().getUTCHours();
+      if (h >= 7 && h < 12) return { name: "LONDON", color: "#4fc3f7" };
+      if (h >= 12 && h < 17) return { name: "NEW YORK", color: "#00e676" };
+      if (h >= 22 || h < 2) return { name: "TOKYO", color: "#ff9800" };
+      return { name: "OFF-SESSION", color: "#555" };
+    };
+
+    const fmt = (n, d = 2) => Number(n).toFixed(d);
+    const pct = (a, b) => (((a - b) / b) * 100).toFixed(2);
+
+    const Dot = ({ color, pulse }) => (
+      <span style={{ display:"inline-block", width:7, height:7, borderRadius:"50%", background:color, boxShadow:`0 0 6px ${color}`, animation: pulse ? "pulse 2s infinite" : "none" }} />
+    );
+
+    const SignalBadge = ({ signal }) => {
+      const map = {
+        BUY:  { bg:"#0a2216", border:"#00e676", text:"#00e676", icon:"▲" },
+        SELL: { bg:"#220a0a", border:"#ff4444", text:"#ff4444", icon:"▼" },
+        WAIT: { bg:"#1c1a08", border:"#ffd600", text:"#ffd600", icon:"◆" },
+      };
+      const c = map[signal] || map.WAIT;
+      return (
+        <div style={{ display:"inline-flex", alignItems:"center", gap:10, background:c.bg, border:`1.5px solid ${c.border}`, borderRadius:3, padding:"8px 22px", boxShadow:`0 0 24px ${c.border}30`, fontFamily:"'Space Mono',monospace", fontSize:26, fontWeight:700, color:c.text, letterSpacing:4 }}>
+          {c.icon} {signal}
+        </div>
+      );
+    };
+
+    const Bar = ({ value, color }) => (
+      <div style={{ background:"#111", borderRadius:2, height:5, overflow:"hidden", flex:1 }}>
+        <div style={{ width:`${Math.min(100,Math.max(0,value))}%`, height:"100%", background:color, boxShadow:`0 0 6px ${color}60`, transition:"width 1.2s cubic-bezier(0.4,0,0.2,1)" }} />
+      </div>
+    );
+
+    const StatCard = ({ label, value, sub, accent="#c8a96e" }) => (
+      <div style={{ background:"#0b0b0b", border:"1px solid #1c1c1c", borderRadius:4, padding:"12px 14px", flex:1, minWidth:110 }}>
+        <div style={{ color:"#3a3a3a", fontSize:9, letterSpacing:2, marginBottom:7 }}>{label}</div>
+        <div style={{ color:accent, fontSize:14, fontWeight:700, fontFamily:"'Space Mono',monospace" }}>{value}</div>
+        {sub && <div style={{ color:"#383838", fontSize:9, marginTop:4 }}>{sub}</div>}
+      </div>
+    );
+
+    const MiniCandle = ({ open, close, high, low, maxRange }) => {
+      const bullish = close >= open;
+      const color = bullish ? "#00e676" : "#ff4444";
+      const bodyH = Math.abs(close - open) / maxRange * 36;
+      const topWick = (high - Math.max(open, close)) / maxRange * 36;
+      const botWick = (Math.min(open, close) - low) / maxRange * 36;
+      return (
+        <div style={{ display:"flex", flexDirection:"column", alignItems:"center", width:10, gap:0 }}>
+          <div style={{ width:1, height:topWick, background:color, opacity:0.6 }} />
+          <div style={{ width:7, height:Math.max(2,bodyH), background:color, borderRadius:1 }} />
+          <div style={{ width:1, height:botWick, background:color, opacity:0.6 }} />
+        </div>
+      );
+    };
+
+    function AurumAgent() {
+      const [marketData, setMarketData] = useState(null);
+      const [analysis, setAnalysis] = useState(null);
+      const [loadingMkt, setLoadingMkt] = useState(false);
+      const [loadingAI, setLoadingAI] = useState(false);
+      const [error, setError] = useState(null);
+      const [lastUpdate, setLastUpdate] = useState(null);
+      const [countdown, setCountdown] = useState(REFRESH_INTERVAL / 1000);
+      const [time, setTime] = useState(new Date());
+      const [history, setHistory] = useState([]);
+      const countRef = useRef(REFRESH_INTERVAL / 1000);
+
+      useEffect(() => {
+        const t = setInterval(() => setTime(new Date()), 1000);
+        return () => clearInterval(t);
+      }, []);
+
+      useEffect(() => {
+        const t = setInterval(() => {
+          countRef.current = Math.max(0, countRef.current - 1);
+          setCountdown(countRef.current);
+        }, 1000);
+        return () => clearInterval(t);
+      }, []);
+
+      const fetchMarket = useCallback(async () => {
+        setLoadingMkt(true);
+        setError(null);
+        try {
+          const [xauRes, dxyRes, h1Res] = await Promise.all([
+            fetch(`https://api.twelvedata.com/quote?symbol=XAU/USD&apikey=${TD_KEY}`),
+            fetch(`https://api.twelvedata.com/quote?symbol=DXY&apikey=${TD_KEY}`),
+            fetch(`https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=1h&outputsize=24&apikey=${TD_KEY}`)
+          ]);
+          const [xau, dxy, h1] = await Promise.all([xauRes.json(), dxyRes.json(), h1Res.json()]);
+          if (xau.status === "error") throw new Error(xau.message || "XAU fetch failed");
+
+          const candles = (h1.values || []).slice(0, 20).reverse();
+          const closes = candles.map(c => parseFloat(c.close));
+          let ema = closes[0];
+          const k = 2 / (Math.min(closes.length, 25) + 1);
+          closes.forEach(p => { ema = p * k + ema * (1 - k); });
+
+          const atrCandles = candles.slice(-15);
+          const trs = atrCandles.slice(1).map((c, i) => {
+            const prev = parseFloat(atrCandles[i].close);
+            return Math.max(parseFloat(c.high) - parseFloat(c.low), Math.abs(parseFloat(c.high) - prev), Math.abs(parseFloat(c.low) - prev));
+          });
+          const atr = trs.reduce((a, b) => a + b, 0) / trs.length;
+
+          const price = parseFloat(xau.close || xau.price);
+          const open24 = parseFloat(xau.open);
+          const dxyVal = parseFloat(dxy.close || dxy.price || 0);
+          const dxyChg = parseFloat(dxy.percent_change || 0);
+
+          const md = { price, open24, change: pct(price, open24), high24: parseFloat(xau.high), low24: parseFloat(xau.low), dxy: dxyVal, dxyChange: dxyChg, ema, atr: fmt(atr, 2), aboveEma: price > ema, candles, session: getSession(), timestamp: new Date() };
+          setMarketData(md);
+          setLastUpdate(new Date());
+          countRef.current = REFRESH_INTERVAL / 1000;
+          setCountdown(REFRESH_INTERVAL / 1000);
+          return { price, open24, dxy: dxyVal, dxyChg, ema, atr, candles, aboveEma: price > ema };
+        } catch (e) {
+          setError("Market data error: " + e.message);
+          return null;
+        } finally {
+          setLoadingMkt(false);
+        }
+      }, []);
+
+      const runAnalysis = useCallback(async (mkt) => {
+        if (!mkt) return;
+        setLoadingAI(true);
+        const sess = getSession();
+        const lastCandles = (mkt.candles || []).slice(-5).map(c => `O:${fmt(c.open)} H:${fmt(c.high)} L:${fmt(c.low)} C:${fmt(c.close)}`).join(" | ");
+        const prompt = `Live XAUUSD market snapshot — ${new Date().toUTCString()}
+PRICE: ${fmt(mkt.price,2)} | 24h: ${pct(mkt.price, mkt.open24)}% | Session: ${sess.name}
+DXY: ${fmt(mkt.dxy,3)} (${mkt.dxyChg>=0?"+":""}${fmt(mkt.dxyChg,2)}%) — ${mkt.dxyChg>0.2?"RISING — bearish for gold":mkt.dxyChg<-0.2?"FALLING — bullish for gold":"FLAT"}
+H1 EMA200: ${fmt(mkt.ema,2)} — price ${mkt.aboveEma?"ABOVE (bullish)":"BELOW (bearish)"}
+ATR(14): ${mkt.atr} — ${parseFloat(mkt.atr)>15?"HIGH VOL":parseFloat(mkt.atr)>8?"NORMAL":"LOW VOL"}
+Last 5 H1 candles: ${lastCandles}
+Provide full trading recommendation as JSON.`;
+
+        try {
+          const res = await fetch("https://api.anthropic.com/v1/messages", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 1000, system: SYSTEM_PROMPT, messages: [{ role: "user", content: prompt }] })
+          });
+          const data = await res.json();
+          const text = (data.content || []).map(b => b.text || "").join("");
+          const parsed = JSON.parse(text.replace(/```json|```/g, "").trim());
+          setAnalysis(parsed);
+          setHistory(prev => [{ ...parsed, time: new Date(), price: mkt.price }, ...prev].slice(0, 8));
+        } catch (e) {
+          setError("AI analysis failed: " + e.message);
+        } finally {
+          setLoadingAI(false);
+        }
+      }, []);
+
+      const refresh = useCallback(async () => {
+        const mkt = await fetchMarket();
+        await runAnalysis(mkt);
+      }, [fetchMarket, runAnalysis]);
+
+      useEffect(() => {
+        refresh();
+        const t = setInterval(refresh, REFRESH_INTERVAL);
+        return () => clearInterval(t);
+      }, [refresh]);
+
+      const sess = getSession();
+      const loading = loadingMkt || loadingAI;
+      const candleMax = marketData?.candles?.length
+        ? Math.max(...marketData.candles.slice(-12).map(c => parseFloat(c.high))) - Math.min(...marketData.candles.slice(-12).map(c => parseFloat(c.low)))
+        : 1;
+      const fmtCountdown = s => `${Math.floor(s/60)}:${String(s%60).padStart(2,"0")}`;
+
+      return (
+        <div style={{ minHeight:"100vh", background:"#050505", color:"#ddd", fontFamily:"'Space Mono',monospace", display:"flex", flexDirection:"column" }}>
+
+          {/* Header */}
+          <div style={{ background:"#080808", borderBottom:"1px solid #161616", padding:"12px 20px", display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+            <div style={{ display:"flex", alignItems:"center", gap:14 }}>
+              <span style={{ fontFamily:"'Bebas Neue'", fontSize:24, letterSpacing:5, color:"#c8a96e" }}>AURUM</span>
+              <span style={{ color:"#222", fontSize:10 }}>|</span>
+              <span style={{ color:"#3a3a3a", fontSize:9, letterSpacing:2 }}>LIVE AI TRADING AGENT</span>
+            </div>
+            <div style={{ display:"flex", alignItems:"center", gap:20 }}>
+              <div style={{ display:"flex", alignItems:"center", gap:6 }}>
+                <Dot color={sess.color} pulse={true} />
+                <span style={{ color:sess.color, fontSize:9, letterSpacing:2 }}>{sess.name}</span>
+              </div>
+              <span style={{ color:"#2a2a2a", fontSize:9 }}>{time.toUTCString().slice(5,25)} UTC</span>
+            </div>
+          </div>
+
+          <div style={{ flex:1, padding:"18px 20px", maxWidth:960, margin:"0 auto", width:"100%" }}>
+
+            {/* Price Hero */}
+            {marketData && (
+              <div style={{ marginBottom:20, animation:"fadeUp 0.4s" }}>
+                <div style={{ display:"flex", alignItems:"flex-end", gap:16, marginBottom:4 }}>
+                  <span style={{ fontFamily:"'Bebas Neue'", fontSize:52, color:"#e8d5a3", letterSpacing:2, lineHeight:1 }}>{fmt(marketData.price,2)}</span>
+                  <span style={{ color: parseFloat(marketData.change)>=0?"#00e676":"#ff4444", fontSize:14, fontWeight:700, paddingBottom:6 }}>{parseFloat(marketData.change)>=0?"+":""}{marketData.change}%</span>
+                  <span style={{ color:"#2a2a2a", fontSize:11, paddingBottom:6 }}>XAU/USD</span>
+                </div>
+                {marketData.candles.length > 0 && (
+                  <div style={{ display:"flex", alignItems:"flex-end", gap:3, height:44, marginBottom:16, paddingBottom:2 }}>
+                    {marketData.candles.slice(-20).map((c,i) => (
+                      <MiniCandle key={i} open={parseFloat(c.open)} close={parseFloat(c.close)} high={parseFloat(c.high)} low={parseFloat(c.low)} maxRange={candleMax} />
+                    ))}
+                  </div>
+                )}
+                <div style={{ display:"flex", gap:8, flexWrap:"wrap" }}>
+                  <StatCard label="DXY" value={fmt(marketData.dxy,3)} sub={`${marketData.dxyChange>=0?"+":""}${fmt(marketData.dxyChange,2)}%`} accent={marketData.dxyChange>0?"#ff6b6b":"#00e676"} />
+                  <StatCard label="H1 EMA200" value={fmt(marketData.ema,2)} sub={marketData.aboveEma?"↑ ABOVE — BULLISH":"↓ BELOW — BEARISH"} accent={marketData.aboveEma?"#00e676":"#ff4444"} />
+                  <StatCard label="ATR (14)" value={marketData.atr} sub={parseFloat(marketData.atr)>15?"HIGH VOL":parseFloat(marketData.atr)>8?"NORMAL":"LOW VOL"} accent="#c8a96e" />
+                  <StatCard label="24H RANGE" value={`${fmt(marketData.low24)} — ${fmt(marketData.high24)}`} accent="#888" />
+                </div>
+              </div>
+            )}
+
+            {/* Refresh bar */}
+            <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:20, padding:"10px 14px", background:"#0a0a0a", border:"1px solid #161616", borderRadius:4 }}>
+              <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+                {loading
+                  ? <><div style={{ width:10, height:10, border:"1.5px solid #333", borderTop:"1.5px solid #c8a96e", borderRadius:"50%", animation:"spin 0.8s linear infinite" }} /><span style={{ color:"#555", fontSize:10 }}>{loadingMkt?"FETCHING MARKET DATA...":"RUNNING AI ANALYSIS..."}</span></>
+                  : <><Dot color="#00e676" pulse={true} /><span style={{ color:"#333", fontSize:10 }}>NEXT REFRESH IN <span style={{ color:"#555" }}>{fmtCountdown(countdown)}</span></span></>
+                }
+              </div>
+              <div style={{ display:"flex", gap:8 }}>
+                {lastUpdate && <span style={{ color:"#2a2a2a", fontSize:9 }}>LAST: {lastUpdate.toLocaleTimeString()}</span>}
+                <button onClick={refresh} disabled={loading} style={{ background:"#141414", color:"#555", borderRadius:3, padding:"5px 14px", fontSize:9, letterSpacing:1, fontFamily:"'Space Mono',monospace" }}>↻ REFRESH NOW</button>
+              </div>
+            </div>
+
+            {/* Error */}
+            {error && <div style={{ background:"#150505", border:"1px solid #2a0000", borderRadius:4, padding:14, color:"#ff4444", fontSize:10, marginBottom:16 }}>⚠ {error}</div>}
+
+            {/* Analysis Result */}
+            {analysis && !loading && (
+              <div style={{ animation:"fadeUp 0.5s", marginBottom:24 }}>
+                <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:14 }}>
+                  <SignalBadge signal={analysis.signal} />
+                  <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+                    <span style={{ color:"#2a2a2a", fontSize:9 }}>BIAS:</span>
+                    <span style={{ color: analysis.bias==="BULLISH"?"#00e676":analysis.bias==="BEARISH"?"#ff4444":"#ffd600", fontSize:10, letterSpacing:2 }}>{analysis.bias}</span>
+                  </div>
+                </div>
+                <div style={{ marginBottom:16 }}>
+                  <div style={{ display:"flex", justifyContent:"space-between", marginBottom:6 }}>
+                    <span style={{ color:"#2a2a2a", fontSize:9, letterSpacing:2 }}>AI CONFIDENCE</span>
+                    <span style={{ color: analysis.confidence>=70?"#00e676":analysis.confidence>=50?"#ffd600":"#ff4444", fontSize:11, fontWeight:700 }}>{analysis.confidence}%</span>
+                  </div>
+                  <Bar value={analysis.confidence} color={analysis.confidence>=70?"#00e676":analysis.confidence>=50?"#ffd600":"#ff4444"} />
+                </div>
+                <div style={{ background:"#090909", border:"1px solid #161616", borderRadius:4, padding:14, marginBottom:14 }}>
+                  <p style={{ color:"#777", fontSize:11, lineHeight:1.8 }}>{analysis.summary}</p>
+                </div>
+                <div style={{ display:"flex", gap:8, flexWrap:"wrap", marginBottom:14 }}>
+                  <StatCard label="ENTRY ZONE" value={analysis.entry} accent="#c8a96e" />
+                  <StatCard label="STOP LOSS" value={analysis.stopLoss} accent="#ff4444" />
+                  <StatCard label="TAKE PROFIT" value={analysis.takeProfit} accent="#00e676" />
+                  <StatCard label="RISK:REWARD" value={analysis.rr} accent="#4fc3f7" />
+                </div>
+                <div style={{ background:"#090909", border:"1px solid #161616", borderRadius:4, padding:14, marginBottom:10 }}>
+                  <div style={{ color:"#252525", fontSize:9, letterSpacing:2, marginBottom:10 }}>AI REASONING</div>
+                  {analysis.reasoning?.map((r,i) => (
+                    <div key={i} style={{ display:"flex", gap:10, marginBottom:9, alignItems:"flex-start" }}>
+                      <span style={{ color:"#c8a96e", fontSize:10, marginTop:2 }}>›</span>
+                      <span style={{ color:"#555", fontSize:11, lineHeight:1.7 }}>{r}</span>
+                    </div>
+                  ))}
+                </div>
+                {analysis.warning && (
+                  <div style={{ background:"#111000", border:"1px solid #2a2400", borderRadius:4, padding:12, display:"flex", gap:10 }}>
+                    <span style={{ color:"#ffd600" }}>⚠</span>
+                    <span style={{ color:"#6a5c00", fontSize:11 }}>{analysis.warning}</span>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Loading skeleton */}
+            {loading && !analysis && (
+              <div style={{ animation:"fadeUp 0.3s" }}>
+                {[100,60,80].map((w,i) => (
+                  <div key={i} style={{ background:"#0d0d0d", borderRadius:3, height:14, width:`${w}%`, marginBottom:12, animation:"shimmer 1.5s infinite" }} />
+                ))}
+              </div>
+            )}
+
+            {/* History */}
+            {history.length > 1 && (
+              <div style={{ marginTop:8 }}>
+                <div style={{ color:"#1e1e1e", fontSize:9, letterSpacing:2, marginBottom:10 }}>SIGNAL HISTORY</div>
+                {history.slice(1).map((h,i) => (
+                  <div key={i} style={{ display:"flex", justifyContent:"space-between", alignItems:"center", padding:"8px 12px", background:"#090909", border:"1px solid #131313", borderRadius:3, marginBottom:5 }}>
+                    <span style={{ color:"#2a2a2a", fontSize:9 }}>{h.time.toLocaleTimeString()}</span>
+                    <span style={{ color:"#444", fontSize:10 }}>XAU: {fmt(h.price,2)}</span>
+                    <span style={{ color: h.signal==="BUY"?"#00e676":h.signal==="SELL"?"#ff4444":"#ffd600", fontSize:10, fontWeight:700, letterSpacing:2 }}>{h.signal}</span>
+                    <span style={{ color:"#2a2a2a", fontSize:9 }}>{h.confidence}% conf</span>
+                    <span style={{ color:"#222", fontSize:9 }}>{h.rr} R:R</span>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            <div style={{ marginTop:30, color:"#1a1a1a", fontSize:9, lineHeight:1.8, borderTop:"1px solid #0f0f0f", paddingTop:14 }}>
+              NOT FINANCIAL ADVICE. FOR EDUCATIONAL PURPOSES ONLY. ALWAYS USE YOUR OWN RISK MANAGEMENT.
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<AurumAgent />);
   </script>
 </body>
 </html>
